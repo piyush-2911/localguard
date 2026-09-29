@@ -1,6 +1,6 @@
 """scan - a security scanner CLI for Python code.
 
-Stage 1: static-analysis-only scanner, wrapping Bandit.
+Static analysis via Bandit and independent local-first LLM review.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

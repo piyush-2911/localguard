@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 from rich.console import Console
 
 from .models import Severity
@@ -21,10 +22,11 @@ _err_console = Console(stderr=True)
 @click.group()
 @click.version_option(package_name="scan")
 def main() -> None:
-    pass
+    """Load project-local configuration before parsing the scan command."""
+    load_dotenv(Path.cwd() / ".env", override=False)
 
 
-@main.command()
+@main.command(name="scan")
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option(
     "--severity-threshold",
@@ -54,10 +56,45 @@ def main() -> None:
     default=False,
     help="Show extra detail (full code snippet per finding).",
 )
-def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_file: Path, verbose: bool) -> None:
+@click.option("--llm-only", is_flag=True, help="Review with an LLM instead of running Bandit.")
+@click.option("--model", envvar="SCAN_MODEL", help="Model identifier served by your endpoint (SCAN_MODEL).")
+@click.option("--base-url", envvar="SCAN_BASE_URL", default="http://localhost:11434/v1",
+              show_default=True, help="OpenAI-compatible API base URL (SCAN_BASE_URL).")
+@click.option("--api-key", envvar="SCAN_API_KEY", default="not-needed", help="Endpoint API key; prefer SCAN_API_KEY.")
+@click.option("--timeout", envvar="SCAN_TIMEOUT", type=click.FloatRange(min=0.1), default=120, show_default=True,
+              help="LLM request timeout in seconds.")
+@click.option("--max-tokens", envvar="SCAN_MAX_TOKENS", type=click.IntRange(min=64), default=1024,
+              show_default=True, help="Maximum tokens the model may generate per chunk.")
+@click.option("--max-findings", envvar="SCAN_MAX_FINDINGS", type=click.IntRange(min=1), default=10,
+              show_default=True, help="Maximum highest-impact findings requested per chunk.")
+@click.option("--chunk-chars", type=click.IntRange(min=256), default=12000, show_default=True,
+              help="Maximum numbered source characters per LLM request.")
+@click.option("--chunk-lines", type=click.IntRange(min=1), default=250, show_default=True,
+              help="Maximum lines per LLM chunk.")
+@click.option("--chunk-overlap", type=click.IntRange(min=0), default=20, show_default=True,
+              help="Context lines repeated between chunks; must be smaller than --chunk-lines.")
+def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_file: Path,
+             verbose: bool, llm_only: bool, model: str, base_url: str, api_key: str,
+             timeout: float, max_tokens: int, max_findings: int, chunk_chars: int,
+             chunk_lines: int, chunk_overlap: int) -> None:
     """Scan PATH (a file or directory) for security issues."""
     try:
-        findings, files_scanned = scan(path, verbose=verbose)
+        if llm_only:
+            from .llm import ReviewClient, scan_llm
+            if chunk_overlap >= chunk_lines:
+                raise ScanError("--chunk-overlap must be smaller than --chunk-lines.")
+            client = ReviewClient(base_url, model or "", api_key, timeout, max_tokens, max_findings)
+            try:
+                findings, files_scanned = scan_llm(
+                    path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,
+                    progress=lambda message: _err_console.print(f"[dim]{message}[/dim]"),
+                )
+            finally:
+                client.close()
+        else:
+            if model and click.get_current_context().get_parameter_source("model") == click.core.ParameterSource.COMMANDLINE:
+                raise ScanError("--model requires --llm-only; hybrid scanning is not implemented yet.")
+            findings, files_scanned = scan(path, verbose=verbose)
     except ScanError as exc:
         _err_console.print(f"[bold red]Error:[/bold red] {exc}")
         sys.exit(2)

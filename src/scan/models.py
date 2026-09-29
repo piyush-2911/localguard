@@ -45,6 +45,7 @@ class Finding:
     code_snippet: str = ""
     confidence: str = ""
     source: str = "bandit"
+    end_line: int | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)

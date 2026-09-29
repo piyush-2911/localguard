@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
+from rich.markup import escape
 
 from .models import Finding, Severity
 
@@ -50,7 +51,7 @@ def render_text(
     summary_line = "  ".join(summary_bits) if summary_bits else "[bold green]No findings[/]"
 
     header = Text.from_markup(
-        f"[bold]scan[/] — scanned [bold]{target}[/] "
+        f"[bold]scan[/] — scanned [bold]{escape(target)}[/] "
         f"({files_scanned} file{'s' if files_scanned != 1 else ''})\n"
         f"Total findings: [bold]{total}[/]   {summary_line}"
     )
@@ -76,22 +77,24 @@ def render_text(
         table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
         table.add_column("Location", style="dim", no_wrap=True)
         table.add_column("Rule", no_wrap=True)
+        table.add_column("Source", no_wrap=True)
         table.add_column("Category", no_wrap=True)
         table.add_column("Description")
 
         for f in sorted(items, key=lambda x: (x.file, x.line)):
             table.add_row(
-                f"{f.file}:{f.line}",
-                f.rule_id,
-                f.category,
-                f.description,
+                Text(f"{f.file}:{f.line}"),
+                Text(f.rule_id),
+                Text(f.source),
+                Text(f.category),
+                Text(f.description),
             )
         console.print(table)
 
         for f in sorted(items, key=lambda x: (x.file, x.line)):
-            console.print(f"  [dim]→ fix:[/] {f.recommendation}")
+            console.print(f"  [dim]→ fix:[/] {escape(f.recommendation)}")
             if verbose and f.code_snippet:
-                console.print(f"    [dim]{f.file}:{f.line}[/]  [italic]{f.code_snippet}[/]")
+                console.print(f"    [dim]{escape(f.file)}:{f.line}[/]  [italic]{escape(f.code_snippet)}[/]")
 
     return buf.getvalue()
 
@@ -146,6 +149,7 @@ def render_markdown(findings: list[Finding], files_scanned: int, target: str) ->
             lines.append(f"### `{f.file}:{f.line}` — {f.category} ({f.rule_id})")
             lines.append("")
             lines.append(f"{f.description}")
+            lines.append(f"\n**Source:** {f.source}")
             lines.append("")
             lines.append(f"**Fix:** {f.recommendation}")
             if f.code_snippet:
