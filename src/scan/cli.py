@@ -9,7 +9,8 @@ import click
 from dotenv import load_dotenv
 from rich.console import Console
 
-from .models import Severity
+from .models import CONFIDENCE_RANK, finding_sort_key
+from .hybrid import run_hybrid
 from .scanner import ScanError, scan
 from . import report as report_mod
 
@@ -57,6 +58,9 @@ def main() -> None:
     help="Show extra detail (full code snippet per finding).",
 )
 @click.option("--llm-only", is_flag=True, help="Review with an LLM instead of running Bandit.")
+@click.option("--static-only", is_flag=True, help="Run Bandit without LLM review.")
+@click.option("--merge-tolerance", type=click.IntRange(min=0), default=3, show_default=True)
+@click.option("--min-confidence", type=click.Choice(list(CONFIDENCE_RANK)), default="needs-review", show_default=True)
 @click.option("--model", envvar="SCAN_MODEL", help="Model identifier served by your endpoint (SCAN_MODEL).")
 @click.option("--base-url", envvar="SCAN_BASE_URL", default="http://localhost:11434/v1",
               show_default=True, help="OpenAI-compatible API base URL (SCAN_BASE_URL).")
@@ -76,25 +80,38 @@ def main() -> None:
 def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_file: Path,
              verbose: bool, llm_only: bool, model: str, base_url: str, api_key: str,
              timeout: float, max_tokens: int, max_findings: int, chunk_chars: int,
-             chunk_lines: int, chunk_overlap: int) -> None:
+             chunk_lines: int, chunk_overlap: int, static_only: bool,
+             merge_tolerance: int, min_confidence: str) -> None:
     """Scan PATH (a file or directory) for security issues."""
+    if llm_only and static_only:
+        raise click.UsageError("--static-only and --llm-only are mutually exclusive.")
+
+    def review_llm():
+        from .llm import ReviewClient, scan_llm
+        if chunk_overlap >= chunk_lines:
+            raise ScanError("--chunk-overlap must be smaller than --chunk-lines.")
+        client = ReviewClient(base_url, model or "", api_key, timeout, max_tokens, max_findings)
+        try:
+            return scan_llm(
+                path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,
+                progress=lambda message: _err_console.print(message, markup=False),
+            )
+        finally:
+            client.close()
+
     try:
         if llm_only:
-            from .llm import ReviewClient, scan_llm
-            if chunk_overlap >= chunk_lines:
-                raise ScanError("--chunk-overlap must be smaller than --chunk-lines.")
-            client = ReviewClient(base_url, model or "", api_key, timeout, max_tokens, max_findings)
-            try:
-                findings, files_scanned = scan_llm(
-                    path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,
-                    progress=lambda message: _err_console.print(f"[dim]{message}[/dim]"),
-                )
-            finally:
-                client.close()
-        else:
-            if model and click.get_current_context().get_parameter_source("model") == click.core.ParameterSource.COMMANDLINE:
-                raise ScanError("--model requires --llm-only; hybrid scanning is not implemented yet.")
+            findings, files_scanned = review_llm()
+            metadata = {"analyzers": {"static": "not-requested", "llm": "available"},
+                        "analyzer_contributions": {"static": 0, "llm": len(findings)}}
+        elif static_only:
             findings, files_scanned = scan(path, verbose=verbose)
+            metadata = {"analyzers": {"static": "available", "llm": "not-requested"},
+                        "analyzer_contributions": {"static": len(findings), "llm": 0}}
+        else:
+            findings, files_scanned, metadata = run_hybrid(
+                lambda: scan(path, verbose=verbose), review_llm, merge_tolerance,
+                warning=lambda message: click.echo(f"Warning: {message}", err=True))
     except ScanError as exc:
         _err_console.print(f"[bold red]Error:[/bold red] {exc}")
         sys.exit(2)
@@ -103,16 +120,18 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
         sys.exit(2)
 
     threshold_rank = _SEVERITY_RANK[severity_threshold.lower()]
-    filtered = [f for f in findings if _SEVERITY_RANK[f.severity.value] >= threshold_rank]
+    confident = [f for f in findings if CONFIDENCE_RANK[f.confidence] >= CONFIDENCE_RANK[min_confidence]]
+    filtered = sorted((f for f in confident if _SEVERITY_RANK[f.severity.value] >= threshold_rank),
+                      key=finding_sort_key)
 
     target_str = str(path)
 
     if output_format == "json":
-        rendered = report_mod.render_json(filtered, files_scanned, target_str)
+        rendered = report_mod.render_json(filtered, files_scanned, target_str, metadata=metadata)
     elif output_format == "markdown":
-        rendered = report_mod.render_markdown(filtered, files_scanned, target_str)
+        rendered = report_mod.render_markdown(filtered, files_scanned, target_str, verbose=verbose, metadata=metadata)
     else:
-        rendered = report_mod.render_text(filtered, files_scanned, target_str, verbose=verbose)
+        rendered = report_mod.render_text(filtered, files_scanned, target_str, verbose=verbose, metadata=metadata)
 
     if output_file:
         try:

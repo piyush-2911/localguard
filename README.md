@@ -2,12 +2,51 @@
 
 A security scanner CLI for Python code.
 
-**Stage 2: static scanning and independent LLM review.** `scan` wraps
+**Stage 3: hybrid static and LLM review.** `scan` wraps
 [Bandit](https://bandit.readthedocs.io/) — Python's standard security
 linter — and turns its output into a clean, colored terminal report, JSON,
-or Markdown, with sensible exit codes for CI use. Static scanning remains
-the default. Use `--llm-only` to review code through a local or explicitly
-configured OpenAI-compatible endpoint. Hybrid scanning is a later stage.
+or Markdown, with sensible exit codes for CI use. Hybrid scanning is the default.
+Use `--static-only` for Bandit alone or `--llm-only` for your configured model alone.
+
+## How hybrid mode works
+
+```powershell
+scan scan ./myproject --model llama3.1 --format json
+scan scan ./myproject --static-only
+scan scan ./myproject --llm-only --model llama3.1
+scan scan ./myproject --merge-tolerance 3 --min-confidence likely --severity-threshold high
+```
+
+Both analyzers run once. Findings share a fixed category taxonomy. The merger
+pairs same-file, same-category findings whose line ranges overlap or are separated
+by at most `--merge-tolerance` lines (default 3). Nearest pairs match first, one
+static finding to one LLM finding, without chaining nearby issues together.
+Repeated findings at overlapping locations within an analyzer are deduplicated;
+different Bandit rules remain separate. Unknown categories become `other`.
+
+| Confidence | Source | Meaning |
+|---|---|---|
+| `confirmed` | `static+llm` | Both analyzers flagged the issue |
+| `likely` | `static` | Bandit reported a deterministic pattern match |
+| `needs-review` | `llm` | Only the probabilistic model flagged it; human review is needed |
+
+These labels describe analyzer agreement, not proof of exploitability. Merged
+findings preserve Bandit's rule ID, source location and snippet, use the LLM's
+explanation and recommendation, and take the higher severity. JSON preserves
+`original_severities` and `explanations` keyed by `static` and `llm`, plus the
+original `bandit_confidence`. Use `--verbose` to see both explanations in text
+and Markdown. Reports sort by descending severity, then confidence.
+
+`--min-confidence` defaults to `needs-review` (everything). Confidence filtering
+runs before severity filtering; only remaining findings cause exit 1. Summary
+confidence counts describe displayed findings; analyzer contributions count input
+findings before merging and filtering, so these counts need not sum to the total.
+
+If one analyzer fails, hybrid mode warns and reports the other analyzer's results,
+including an `LLM analysis unavailable` or `Static analysis unavailable` status in
+every report format. If the LLM fails partway through, its partial findings are
+discarded. If both fail, exit 2. Single-analyzer modes retain their own failure
+behavior. A missing LLM model configuration also permits static fallback.
 
 ## What it catches
 
@@ -165,7 +204,20 @@ scan scan ./myproject --llm-only --model your-served-model --base-url http://loc
 ### LLM findings and failure behavior
 
 The prompt requests a JSON array with `line`, optional `end_line`, `severity`,
-`category`, `description`, and `recommendation`. Both line fields use absolute
+`category`, `description`, `recommendation`, and `evidence` (verbatim affected code).
+Evidence is checked against the chunk, ignoring outer whitespace. If the reported
+line is wrong but the quoted code has one exact match, the scanner corrects it.
+Single-line expression excerpts are also matched by exact Python tokens, excluding
+comments and preserving identifier and string-literal contents.
+Missing, invented, comment-only, or ambiguously located evidence is skipped with
+a warning. A quote matching the reported location is accepted; use a multiline
+quote to distinguish repeated code. End lines are derived from multiline evidence,
+not trusted from the model. This verifies the quoted location, not whether the
+model's security interpretation is correct. No second model call is needed.
+If every returned finding fails validation, LLM-only mode exits 2 rather than
+presenting a clean result; hybrid mode falls back to static analysis. If some
+findings survive, warnings identify skipped entries and coverage is partial.
+Both line fields use absolute
 source line numbers, including in later chunks. Findings use the existing model
 with `source: "llm"`, `rule_id: "LLM"`, and optional `end_line`. All report formats
 show the source. Existing severity filters, output files, verbose snippets and
@@ -179,14 +231,15 @@ common `{ "findings": [...] }` wrapper produced by some local models.
 If the model truncates the array after emitting one or more complete finding
 objects, those complete findings are recovered and a warning notes partial coverage.
 Warnings never include raw model output or API keys. HTTP, connection and timeout
-errors stop the scan with a clear message and exit 2. Successful processing exits
+errors stop LLM-only scans with a clear message and exit 2; hybrid mode falls back
+to Bandit. Successful processing exits
 1 when reported findings exist, otherwise 0, **even if malformed chunks were
 skipped**; inspect stderr for incomplete coverage before treating a scan as clean.
 
 Directory scans skip common environment/build/cache directories and nested
 symlinks. Python encoding declarations are respected. Empty files count as scanned
 without making a request. Chunks overlap and retain absolute line numbers; exact
-LLM duplicates from overlap are removed. No Bandit results are merged or deduplicated.
+LLM duplicates from overlap are removed. Hybrid mode also reconciles Bandit results.
 An individual line exceeding the character cap requires increasing `--chunk-chars`.
 
 Source is sent only to the configured endpoint, localhost by default; a remote URL
@@ -294,5 +347,4 @@ Tests use a local HTTP fixture; no model or remote service is needed.
 
 ## What's next (later stages, not in this release)
 
-Planned next: a hybrid engine that merges and confidence-scores both sources,
-a config file system, CI-friendly output/exit-code polish, and auto-fix suggestions.
+Later stages may add richer configuration, CI integration, and reviewed fix suggestions.

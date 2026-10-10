@@ -11,7 +11,26 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.markup import escape
 
-from .models import Finding, Severity
+from .models import Finding, Severity, CONFIDENCE_RANK, finding_sort_key
+
+
+def _summary(findings, metadata=None):
+    return {
+        "counts_by_confidence": {level: sum(f.confidence == level for f in findings)
+                                 for level in CONFIDENCE_RANK},
+        "analyzer_contributions": (metadata or {}).get("analyzer_contributions", {
+            "static": sum(f.source in ("static", "static+llm") for f in findings),
+            "llm": sum(f.source in ("llm", "static+llm") for f in findings)}),
+        "analyzers": (metadata or {}).get("analyzers", {}),
+    }
+
+
+def _summary_lines(findings, metadata):
+    summary = _summary(findings, metadata)
+    return ["  ".join(f"{key}: {value}" for key, value in summary["counts_by_confidence"].items()),
+            "Analyzer contributions (before merge/filter): " + ", ".join(
+                f"{key}: {value}" for key, value in summary["analyzer_contributions"].items())] + [
+                value for value in summary["analyzers"].values() if "unavailable" in value]
 
 _SEVERITY_ORDER = [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW]
 
@@ -35,6 +54,7 @@ def render_text(
     files_scanned: int,
     target: str,
     verbose: bool = False,
+    metadata: dict | None = None,
 ) -> str:
     """Render a colored terminal report, grouped by severity."""
     buf = StringIO()
@@ -56,9 +76,11 @@ def render_text(
         f"Total findings: [bold]{total}[/]   {summary_line}"
     )
     console.print(Panel(header, expand=False, border_style="blue"))
+    for line in _summary_lines(findings, metadata):
+        console.print(Text(line))
 
     if not findings:
-        console.print("[bold green]✔ No issues found.[/]")
+        console.print("No findings match the selected filters.")
         return buf.getvalue()
 
     grouped: dict[Severity, list[Finding]] = {s: [] for s in _SEVERITY_ORDER}
@@ -78,28 +100,33 @@ def render_text(
         table.add_column("Location", style="dim", no_wrap=True)
         table.add_column("Rule", no_wrap=True)
         table.add_column("Source", no_wrap=True)
+        table.add_column("Confidence", no_wrap=True)
         table.add_column("Category", no_wrap=True)
         table.add_column("Description")
 
-        for f in sorted(items, key=lambda x: (x.file, x.line)):
+        for f in sorted(items, key=finding_sort_key):
             table.add_row(
                 Text(f"{f.file}:{f.line}"),
                 Text(f.rule_id),
-                Text(f.source),
+                Text(f"[{f.source}]"),
+                Text(f.confidence),
                 Text(f.category),
                 Text(f.description),
             )
         console.print(table)
 
-        for f in sorted(items, key=lambda x: (x.file, x.line)):
+        for f in sorted(items, key=finding_sort_key):
             console.print(f"  [dim]→ fix:[/] {escape(f.recommendation)}")
             if verbose and f.code_snippet:
                 console.print(f"    [dim]{escape(f.file)}:{f.line}[/]  [italic]{escape(f.code_snippet)}[/]")
+            if verbose and f.source == "static+llm":
+                for source, explanation in f.explanations.items():
+                    console.print(Text(f"    {source}: {explanation}"))
 
     return buf.getvalue()
 
 
-def render_json(findings: list[Finding], files_scanned: int, target: str) -> str:
+def render_json(findings: list[Finding], files_scanned: int, target: str, metadata=None) -> str:
     payload = {
         "target": target,
         "files_scanned": files_scanned,
@@ -107,12 +134,14 @@ def render_json(findings: list[Finding], files_scanned: int, target: str) -> str
         "counts_by_severity": {
             sev.value: c for sev, c in _counts_by_severity(findings).items()
         },
-        "findings": [f.to_dict() for f in findings],
+        **_summary(findings, metadata),
+        "findings": [f.to_dict() for f in sorted(findings, key=finding_sort_key)],
     }
     return json.dumps(payload, indent=2)
 
 
-def render_markdown(findings: list[Finding], files_scanned: int, target: str) -> str:
+def render_markdown(findings: list[Finding], files_scanned: int, target: str,
+                    verbose: bool = False, metadata=None) -> str:
     counts = _counts_by_severity(findings)
     total = len(findings)
 
@@ -122,6 +151,7 @@ def render_markdown(findings: list[Finding], files_scanned: int, target: str) ->
     lines.append(f"**Target:** `{target}`  ")
     lines.append(f"**Files scanned:** {files_scanned}  ")
     lines.append(f"**Total findings:** {total}")
+    lines.extend("\n" + line for line in _summary_lines(findings, metadata))
     lines.append("")
     lines.append("| Severity | Count |")
     lines.append("|---|---|")
@@ -131,7 +161,7 @@ def render_markdown(findings: list[Finding], files_scanned: int, target: str) ->
     lines.append("")
 
     if not findings:
-        lines.append("✅ No issues found.")
+        lines.append("No findings match the selected filters.")
         return "\n".join(lines)
 
     grouped: dict[Severity, list[Finding]] = {s: [] for s in _SEVERITY_ORDER}
@@ -145,11 +175,15 @@ def render_markdown(findings: list[Finding], files_scanned: int, target: str) ->
         emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}[sev.value]
         lines.append(f"## {emoji} {sev.value.upper()} ({len(items)})")
         lines.append("")
-        for f in sorted(items, key=lambda x: (x.file, x.line)):
+        for f in sorted(items, key=finding_sort_key):
             lines.append(f"### `{f.file}:{f.line}` — {f.category} ({f.rule_id})")
             lines.append("")
             lines.append(f"{f.description}")
             lines.append(f"\n**Source:** {f.source}")
+            lines.append(f"\n**Confidence:** {f.confidence}")
+            if verbose and f.source == "static+llm":
+                lines.extend(f"\n**{source} explanation:** {explanation}"
+                             for source, explanation in f.explanations.items())
             lines.append("")
             lines.append(f"**Fix:** {f.recommendation}")
             if f.code_snippet:

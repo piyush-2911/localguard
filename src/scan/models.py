@@ -31,8 +31,8 @@ _SEVERITY_ORDER = {
 class Finding:
     """A single normalized security finding.
 
-    `category` is Bandit's test name (e.g. "hardcoded_password_string"),
-    `rule_id` is Bandit's short test id (e.g. "B105").
+    `category` uses the shared canonical taxonomy. `rule_id` retains Bandit's
+    test ID on static/merged findings. Original evidence is keyed by analyzer.
     """
 
     file: str
@@ -43,9 +43,12 @@ class Finding:
     recommendation: str
     rule_id: str
     code_snippet: str = ""
-    confidence: str = ""
-    source: str = "bandit"
+    confidence: str = "likely"
+    source: str = "static"
     end_line: int | None = None
+    original_severities: dict = field(default_factory=dict)
+    explanations: dict = field(default_factory=dict)
+    bandit_confidence: str = ""
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -60,3 +63,11 @@ class ScanSummary:
     total: int = 0
     counts_by_severity: dict = field(default_factory=dict)
     files_scanned: int = 0
+
+
+CONFIDENCE_RANK = {"needs-review": 0, "likely": 1, "confirmed": 2}
+
+
+def finding_sort_key(finding: Finding) -> tuple:
+    return (-finding.severity.rank, -CONFIDENCE_RANK.get(finding.confidence, 0),
+            finding.file, finding.line, finding.category, finding.rule_id)

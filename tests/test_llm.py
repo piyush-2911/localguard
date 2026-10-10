@@ -19,7 +19,8 @@ from scan.scanner import ScanError
 
 def finding(line=1):
     return {"line": line, "severity": "high", "category": "access_control",
-            "description": "User-supplied owner is trusted", "recommendation": "Check authenticated ownership"}
+            "description": "User-supplied owner is trusted", "recommendation": "Check authenticated ownership",
+            "evidence": "x"}
 
 
 class ReviewerTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class ReviewerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "app.py"
-        self.path.write_text("owner = request.args['owner']\n", encoding="utf-8")
+        self.path.write_text("x\n", encoding="utf-8")
 
     def set_content(self, content, finish="stop"):
         type(self).response = {"choices": [{"finish_reason": finish, "message": {"content": content}}]}
@@ -77,7 +78,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertNotIn("response_format", self.payload)
         self.assertEqual(self.payload["max_tokens"], 1024)
         self.assertIn("at most 10 highest-impact findings", self.payload["messages"][1]["content"])
-        self.assertIn("1: owner", self.payload["messages"][1]["content"])
+        self.assertIn("1: x", self.payload["messages"][1]["content"])
         self.assertIn("Reviewing", result.stderr)
         self.assertIn("Request finished", result.stderr)
 
@@ -93,9 +94,10 @@ class ReviewerTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.set_content(content)
                 result = self.invoke("--format", "json")
-                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(result.exit_code, 2 if content == '{"findings": [null]}' else 0, result.output)
                 self.assertIn("Skipping ", result.stderr)
-                self.assertEqual(json.loads(result.stdout)["total_findings"], 0)
+                if result.exit_code == 0:
+                    self.assertEqual(json.loads(result.stdout)["total_findings"], 0)
 
     def test_http_and_truncation_errors(self):
         for status in (401, 404, 429, 500, 302):
@@ -121,13 +123,13 @@ class ReviewerTests(unittest.TestCase):
                                          "--output", str(output)], env={"SCAN_MODEL": "env-model",
                                          "SCAN_BASE_URL": self.url, "SCAN_API_KEY": "env-key"})
         self.assertEqual(result.exit_code, 1, result.output)
-        self.assertIn("access_control", output.read_text(encoding="utf-8"))
+        self.assertIn("access-control", output.read_text(encoding="utf-8"))
         self.assertEqual(self.payload["model"], "env-model")
         self.assertEqual(self.auth, "Bearer env-key")
 
-    def test_static_default(self):
+    def test_static_only(self):
         with patch("scan.cli.scan", return_value=([], 1)) as static:
-            result = CliRunner().invoke(main, ["scan", str(self.path)], env={"SCAN_MODEL": ""})
+            result = CliRunner().invoke(main, ["scan", str(self.path), "--static-only"], env={"SCAN_MODEL": ""})
         self.assertEqual(result.exit_code, 0, result.output)
         static.assert_called_once()
 
@@ -136,7 +138,7 @@ class ReviewerTests(unittest.TestCase):
         chunks = code_chunks(["x = 1"] * 520)
         self.assertEqual([(c.start, c.end) for c in chunks], [(1, 250), (231, 480), (461, 520)])
         client = Mock()
-        client.review.side_effect = ["[partial", json.dumps([finding(240)]), "[]"]
+        client.review.side_effect = ["[partial", json.dumps([dict(finding(240), evidence="x = 1")]), "[]"]
         with self.assertLogs("scan.llm", level="WARNING"):
             findings, count = scan_llm(self.path, client)
         self.assertEqual(count, 1)
@@ -144,8 +146,8 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(client.review.call_count, 3)
 
     def test_end_line_and_valid_siblings(self):
-        valid = dict(finding(235), end_line=240)
-        invalid = dict(finding(235), end_line=999)
+        valid = dict(finding(235), end_line=240, evidence="\n".join(["x"] * 6))
+        invalid = dict(finding(235), evidence="invented code")
         with self.assertLogs("scan.llm", level="WARNING"):
             result = parse_review(json.dumps([invalid, valid]), self.path, Chunk(231, ["x"] * 250))
         self.assertEqual(len(result), 1)
@@ -230,13 +232,13 @@ class ReviewerTests(unittest.TestCase):
             covered.update(range(chunk.start, chunk.end + 1))
         self.assertEqual(covered, set(range(1, 101)))
         chunk = chunks[-1]
-        items = parse_review(json.dumps([finding(chunk.start)]), self.path, chunk)
+        items = parse_review(json.dumps([dict(finding(chunk.start), evidence=chunk.lines[0])]), self.path, chunk)
         self.assertEqual(items[0].line, chunk.start)
         with self.assertRaises(ScanError):
             code_chunks(["x" * 300], 256)
 
     def test_schema_validation(self):
-        for field, value in (("line", True), ("line", 0), ("line", 2), ("severity", "urgent"),
+        for field, value in (("line", True), ("line", 0), ("severity", "urgent"),
                              ("description", ""), ("recommendation", None), ("category", 42)):
             item = finding()
             item[field] = value
@@ -284,6 +286,66 @@ class ReviewerTests(unittest.TestCase):
         self.path.write_text("")
         with patch.object(ReviewClient, "review", side_effect=AssertionError):
             self.assertEqual(scan_llm(root, ReviewClient(self.url, "test")), ([], 1))
+
+    def test_wrong_line_is_relocated_by_exact_evidence(self):
+        chunk = Chunk(40, ["# hash password", "", "    return hashlib.md5(password).hexdigest()"])
+        item = dict(finding(999), evidence="return hashlib.md5(password).hexdigest()", end_line=1000)
+        with self.assertLogs("scan.llm", level="WARNING"):
+            result = parse_review(json.dumps([item]), self.path, chunk)
+        self.assertEqual(result[0].line, 42)
+        self.assertIsNone(result[0].end_line)
+        self.assertIn("hashlib.md5", result[0].code_snippet)
+
+    def test_missing_invented_and_comment_evidence_rejected(self):
+        for evidence in (None, "", "eval(other)", "# eval(user)"):
+            with self.subTest(evidence=evidence), self.assertLogs("scan.llm", level="WARNING"):
+                result = parse_review(json.dumps([dict(finding(), evidence=evidence)]),
+                                      self.path, Chunk(1, ["# eval(user)", "eval(user)"]))
+                self.assertEqual(result, [])
+
+    def test_all_ungrounded_findings_do_not_report_clean_scan(self):
+        self.set_content(json.dumps([dict(finding(), evidence="invented code")]))
+        result = self.invoke("--format", "json")
+        self.assertEqual(result.exit_code, 2, result.output)
+        self.assertIn("analysis is incomplete, not clean", " ".join(result.stderr.split()))
+        self.assertNotIn('"total_findings"', result.stdout)
+
+    def test_ambiguous_evidence_is_not_guessed(self):
+        chunk = Chunk(10, ["eval(user)", "pass", "eval(user)"])
+        with self.assertLogs("scan.llm", level="WARNING"):
+            self.assertEqual(parse_review(json.dumps([dict(finding(11), evidence="eval(user)")]),
+                                          self.path, chunk), [])
+        result = parse_review(json.dumps([dict(finding(12), evidence="eval(user)")]), self.path, chunk)
+        self.assertEqual(result[0].line, 12)
+
+    def test_multiline_evidence_derives_range(self):
+        chunk = Chunk(100, ["if admin:", "    eval(user)", "else:", "    eval(user)"])
+        item = dict(finding(1), evidence="else:\n    eval(user)", end_line=400)
+        with self.assertLogs("scan.llm", level="WARNING"):
+            result = parse_review(json.dumps([item]), self.path, chunk)
+        self.assertEqual((result[0].line, result[0].end_line), (102, 103))
+
+    def test_exact_expression_token_match(self):
+        chunk = Chunk(51, ["# eval(expression)", "    return eval(expression)"])
+        with self.assertLogs("scan.llm", level="WARNING"):
+            result = parse_review(json.dumps([dict(finding(51), evidence="eval( expression )")]),
+                                  self.path, chunk)
+        self.assertEqual(result[0].line, 52)
+        with self.assertLogs("scan.llm", level="WARNING"):
+            self.assertEqual(parse_review(json.dumps([dict(finding(52), evidence="expression")]),
+                                          self.path, Chunk(52, ["return eval(other_expression)"])), [])
+
+    def test_live_ollama_expression_regressions(self):
+        lines = ["x"] * 78
+        lines[13] = 'DB_PASSWORD = "SuperSecret123!"  # noqa: hardcoded password'
+        lines[34] = "    return eval(expression)"
+        lines[51] = '    query = "SELECT * FROM users WHERE username = \'%s\'" % username'
+        items = [dict(finding(14), evidence=lines[13]),
+                 dict(finding(53), evidence='"SELECT * FROM users WHERE username = \'%s\'"'),
+                 dict(finding(33), evidence="return eval(expression)")]
+        with self.assertLogs("scan.llm", level="WARNING"):
+            results = parse_review(json.dumps(items), self.path, Chunk(1, lines))
+        self.assertEqual([f.line for f in results], [14, 52, 35])
 
 
 if __name__ == "__main__":

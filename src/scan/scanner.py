@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .models import Finding, Severity
+from .categories import BANDIT_CATEGORIES
 
 
 class ScanError(Exception):
@@ -176,6 +177,10 @@ def run_bandit(target: Path) -> dict:
             f"stderr: {proc.stderr.strip() or '(empty)'}"
         ) from exc
 
+    if proc.returncode not in (0, 1):
+        raise ScanError(f"Bandit failed with exit code {proc.returncode}.")
+    if data.get("errors"):
+        raise ScanError("Bandit could not analyze one or more files; its scan is incomplete.")
     return data
 
 
@@ -195,12 +200,16 @@ def parse_findings(bandit_json: dict, verbose: bool = False) -> list[Finding]:
                 file=result.get("filename", ""),
                 line=int(result.get("line_number", 0)),
                 severity=_severity_from_bandit(result.get("issue_severity", "LOW")),
-                category=result.get("test_name", "unknown"),
+                category=BANDIT_CATEGORIES.get(rule_id, "other"),
                 description=result.get("issue_text", "").strip(),
                 recommendation=hint,
                 rule_id=rule_id,
                 code_snippet=snippet,
-                confidence=result.get("issue_confidence", ""),
+                confidence="likely",
+                bandit_confidence=result.get("issue_confidence", ""),
+                end_line=max(result.get("line_range") or [line_no]),
+                original_severities={"static": _severity_from_bandit(result.get("issue_severity", "LOW")).value},
+                explanations={"static": result.get("issue_text", "").strip()},
             )
         )
 
