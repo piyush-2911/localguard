@@ -58,6 +58,9 @@ def main() -> None:
     help="Show extra detail (full code snippet per finding).",
 )
 @click.option("--llm-only", is_flag=True, help="Review with an LLM instead of running Bandit.")
+@click.option("--structured-output", envvar="SCAN_STRUCTURED_OUTPUT",
+              type=click.Choice(["auto", "required", "off"]), default="auto", show_default=True,
+              help="Request JSON schema; auto falls back only on explicit unsupported-format errors.")
 @click.option("--static-only", is_flag=True, help="Run Bandit without LLM review.")
 @click.option("--merge-tolerance", type=click.IntRange(min=0), default=3, show_default=True)
 @click.option("--min-confidence", type=click.Choice(list(CONFIDENCE_RANK)), default="needs-review", show_default=True)
@@ -81,7 +84,7 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
              verbose: bool, llm_only: bool, model: str, base_url: str, api_key: str,
              timeout: float, max_tokens: int, max_findings: int, chunk_chars: int,
              chunk_lines: int, chunk_overlap: int, static_only: bool,
-             merge_tolerance: int, min_confidence: str) -> None:
+             merge_tolerance: int, min_confidence: str, structured_output: str) -> None:
     """Scan PATH (a file or directory) for security issues."""
     if llm_only and static_only:
         raise click.UsageError("--static-only and --llm-only are mutually exclusive.")
@@ -90,7 +93,8 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
         from .llm import ReviewClient, scan_llm
         if chunk_overlap >= chunk_lines:
             raise ScanError("--chunk-overlap must be smaller than --chunk-lines.")
-        client = ReviewClient(base_url, model or "", api_key, timeout, max_tokens, max_findings)
+        client = ReviewClient(base_url, model or "", api_key, timeout, max_tokens, max_findings,
+                              structured_output=structured_output)
         try:
             return scan_llm(
                 path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,

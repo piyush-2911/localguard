@@ -113,7 +113,7 @@ scan scan ./myproject --llm-only --model llama3.1
 The executable and subcommand are both named `scan`, matching Stage 1.
 The client uses the [OpenAI Python SDK](https://developers.openai.com/api/docs/libraries)
 with an explicit base URL and the common `/chat/completions` protocol. No
-provider-specific JSON mode is required. Ollama, LM Studio, vLLM,
+provider-specific client is required. Ollama, LM Studio, vLLM,
 text-generation-webui and proxies exposing this protocol can be selected through
 `--base-url` and their served model name. Native Anthropic endpoints require an
 OpenAI-compatible proxy; the Anthropic Messages API is a different protocol.
@@ -127,6 +127,7 @@ OpenAI-compatible proxy; the Anthropic Messages API is a different protocol.
 | `--timeout`       | 120 seconds per request               | `SCAN_TIMEOUT`     |
 | `--max-tokens`    | 1024 generated tokens per chunk       | `SCAN_MAX_TOKENS`  |
 | `--max-findings`  | 10 highest-impact findings per chunk  | `SCAN_MAX_FINDINGS`|
+| `--structured-output` | `auto` (`auto`, `required`, `off`) | `SCAN_STRUCTURED_OUTPUT` |
 | `--chunk-lines`   | 250                                   | —                   |
 | `--chunk-overlap` | 20 (must be smaller than chunk-lines) | —                   |
 | `--chunk-chars`   | 12000 (additional source-size limit)  | —                   |
@@ -151,6 +152,7 @@ SCAN_API_KEY=not-needed
 SCAN_TIMEOUT=120
 SCAN_MAX_TOKENS=1024
 SCAN_MAX_FINDINGS=10
+SCAN_STRUCTURED_OUTPUT=auto
 ```
 
 You can still configure values for one shell session in PowerShell:
@@ -203,12 +205,37 @@ scan scan ./myproject --llm-only --model your-served-model --base-url http://loc
 
 ### LLM findings and failure behavior
 
-The prompt requests a JSON array with `line`, optional `end_line`, `severity`,
+By default, the client requests [schema-constrained structured output](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=chat)
+using the standard chat-completions `response_format`. The response is an object
+containing a `findings` array. Every finding must include `line`, `end_line` (null
+for a single line), `severity`, a canonical `category`, `description`,
+`recommendation`, and `evidence`. Local validation checks these fields even if
+the server ignores the schema. Invalid or truncated structured responses fail
+LLM analysis: LLM-only exits 2 and hybrid falls back to Bandit. Schema constraints
+prevent missing fields and malformed output; they do not prove a vulnerability
+exists or that the evidence points to the right operation.
+
+`--structured-output auto` retries without the schema only after an explicit
+HTTP 400/422 error stating that the format is unsupported. A warning announces
+the downgrade, which applies to subsequent chunks in that scan. Authentication,
+timeout, rate-limit, server errors, and invalid responses do not trigger this
+fallback. Use `required` to prohibit downgrading, or `off` for legacy endpoints:
+
+```powershell
+scan scan examples/vulnerable_sample.py --llm-only --model llama3.1:latest --structured-output required --max-findings 5 --max-tokens 1600 --timeout 600
+```
+
+In legacy mode, the prompt requests a JSON array with `line`, optional `end_line`, `severity`,
 `category`, `description`, `recommendation`, and `evidence` (verbatim affected code).
 Evidence is checked against the chunk, ignoring outer whitespace. If the reported
 line is wrong but the quoted code has one exact match, the scanner corrects it.
 Single-line expression excerpts are also matched by exact Python tokens, excluding
 comments and preserving identifier and string-literal contents.
+If evidence has no match, the scanner also tries removing the displayed `35: `
+style prefix from every quoted line. This fallback requires complete source lines
+to match exactly (apart from outer whitespace); it does not repair altered code or
+use the prefix numbers to resolve ambiguous matches. Original evidence is checked
+first to preserve numeric keys and literal text.
 Missing, invented, comment-only, or ambiguously located evidence is skipped with
 a warning. A quote matching the reported location is accepted; use a multiline
 quote to distinguish repeated code. End lines are derived from multiline evidence,
@@ -223,7 +250,8 @@ with `source: "llm"`, `rule_id: "LLM"`, and optional `end_line`. All report form
 show the source. Existing severity filters, output files, verbose snippets and
 exit codes apply.
 
-Malformed/partial JSON or incomplete completions produce a warning on stderr,
+In legacy mode (`off` or an announced compatibility fallback),
+malformed/partial JSON or incomplete completions produce a warning on stderr,
 skip that chunk, and continue. Markdown fences are tolerated. Invalid individual
 findings are warned about and skipped while valid siblings are retained.
 The parser also accepts explanatory text around a complete JSON array and the
@@ -243,7 +271,8 @@ LLM duplicates from overlap are removed. Hybrid mode also reconciles Bandit resu
 An individual line exceeding the character cap requires increasing `--chunk-chars`.
 
 Source is sent only to the configured endpoint, localhost by default; a remote URL
-sends source remotely. No cloud fallback, automatic retries, proxy environment
+sends source remotely. Apart from the explicit format-capability fallback above,
+no cloud fallback, automatic retries, proxy environment
 routing, or redirects are used. Bandit is not run in LLM-only mode, though it remains
 an installation dependency. Models can miss issues or produce false positives;
 review findings. Each request sees one file chunk, so distant or cross-file flows

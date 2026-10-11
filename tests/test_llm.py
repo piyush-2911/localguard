@@ -63,7 +63,7 @@ class ReviewerTests(unittest.TestCase):
 
     def invoke(self, *args):
         return CliRunner().invoke(main, ["scan", str(self.path), "--llm-only", "--model",
-                                        "test-model", "--base-url", self.url, *args])
+                                        "test-model", "--base-url", self.url, "--structured-output", "off", *args])
 
     def test_real_http_cli_without_bandit(self):
         with patch("scan.cli.scan", side_effect=AssertionError("Bandit invoked")):
@@ -121,7 +121,8 @@ class ReviewerTests(unittest.TestCase):
         output = Path(self.temp.name) / "report.md"
         result = CliRunner().invoke(main, ["scan", str(self.path), "--llm-only", "--format", "markdown",
                                          "--output", str(output)], env={"SCAN_MODEL": "env-model",
-                                         "SCAN_BASE_URL": self.url, "SCAN_API_KEY": "env-key"})
+                                         "SCAN_BASE_URL": self.url, "SCAN_API_KEY": "env-key",
+                                         "SCAN_STRUCTURED_OUTPUT": "off"})
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIn("access-control", output.read_text(encoding="utf-8"))
         self.assertEqual(self.payload["model"], "env-model")
@@ -132,6 +133,16 @@ class ReviewerTests(unittest.TestCase):
             result = CliRunner().invoke(main, ["scan", str(self.path), "--static-only"], env={"SCAN_MODEL": ""})
         self.assertEqual(result.exit_code, 0, result.output)
         static.assert_called_once()
+
+    def test_schema_http_and_cli_precedence(self):
+        self.set_content(json.dumps({"findings": [dict(finding(), category="access-control", end_line=None)]}))
+        for args, env in [([], {}), ([], {"SCAN_STRUCTURED_OUTPUT": "required"}),
+                          (["--structured-output", "required"], {"SCAN_STRUCTURED_OUTPUT": "off"})]:
+            result = CliRunner().invoke(main, ["scan", str(self.path), "--llm-only", "--model", "test",
+                                               "--base-url", self.url, "--format", "json", *args], env=env)
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertEqual(json.loads(result.stdout)["findings"][0]["line"], 1)
+            self.assertEqual(self.payload["response_format"]["type"], "json_schema")
 
     def test_line_chunks_and_continuation(self):
         self.path.write_text("x = 1\n" * 520)
@@ -167,7 +178,7 @@ class ReviewerTests(unittest.TestCase):
     def test_config_precedence_and_placeholder(self):
         with patch("scan.llm.OpenAI") as sdk:
             sdk.return_value.chat.completions.create.return_value = Mock(
-                choices=[Mock(finish_reason="stop", message=Mock(content="[]"))])
+                choices=[Mock(finish_reason="stop", message=Mock(content='{"findings": []}'))])
             result = CliRunner().invoke(main, ["scan", str(self.path), "--llm-only", "--timeout", "17"],
                                        env={"SCAN_MODEL": "env-model", "SCAN_BASE_URL": self.url,
                                             "SCAN_TIMEOUT": "23", "SCAN_API_KEY": "",
@@ -202,7 +213,7 @@ class ReviewerTests(unittest.TestCase):
                 source.write_text("x = 1\n", encoding="utf-8")
                 with patch("scan.llm.OpenAI") as sdk:
                     sdk.return_value.chat.completions.create.return_value = Mock(
-                        choices=[Mock(finish_reason="stop", message=Mock(content="[]"))]
+                        choices=[Mock(finish_reason="stop", message=Mock(content='{"findings": []}'))]
                     )
                     result = runner.invoke(main, ["scan", str(source), "--llm-only"])
             finally:
@@ -282,7 +293,7 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(python_files(root), [self.path])
         self.path.write_bytes(b"# coding: latin-1\nx = '\xe9'\n")
         self.set_content('[]')
-        self.assertEqual(scan_llm(root, ReviewClient(self.url, "test")), ([], 1))
+        self.assertEqual(scan_llm(root, ReviewClient(self.url, "test", structured_output="off")), ([], 1))
         self.path.write_text("")
         with patch.object(ReviewClient, "review", side_effect=AssertionError):
             self.assertEqual(scan_llm(root, ReviewClient(self.url, "test")), ([], 1))
@@ -346,6 +357,40 @@ class ReviewerTests(unittest.TestCase):
         with self.assertLogs("scan.llm", level="WARNING"):
             results = parse_review(json.dumps(items), self.path, Chunk(1, lines))
         self.assertEqual([f.line for f in results], [14, 52, 35])
+
+    def test_numbered_evidence_exact_line_and_relocation(self):
+        chunk = Chunk(35, ["    return eval(expression)"])
+        for proposed in (35, 999):
+            result = parse_review(json.dumps([dict(finding(proposed), evidence="35:     return eval(expression)")]),
+                                  self.path, chunk)
+            self.assertEqual(result[0].line, 35)
+            self.assertEqual(result[0].code_snippet, chunk.lines[0])
+
+    def test_numbered_multiline_evidence(self):
+        chunk = Chunk(100, ["if admin:", "    eval(user)", "else:", "    eval(user)"])
+        result = parse_review(json.dumps([dict(finding(102), evidence="102: else:\n103:     eval(user)")]),
+                              self.path, chunk)
+        self.assertEqual((result[0].line, result[0].end_line), (102, 103))
+
+    def test_numbered_evidence_rejects_modified_partial_or_comment_code(self):
+        for evidence in ("35: eval(expression)", "35: return eval(other)",
+                         "35: return eval(expression);", "35: # return eval(expression)",
+                         "Line 35: return eval(expression)", "35 | return eval(expression)",
+                         "35: return eval(expression)\npass"):
+            with self.subTest(evidence=evidence), self.assertLogs("scan.llm", level="WARNING"):
+                self.assertEqual(parse_review(json.dumps([dict(finding(35), evidence=evidence)]),
+                                              self.path, Chunk(35, ["return eval(expression)"])), [])
+
+    def test_numbered_evidence_does_not_disambiguate_using_prefix(self):
+        chunk = Chunk(35, ["eval(user)", "pass", "eval(user)"])
+        with self.assertLogs("scan.llm", level="WARNING"):
+            self.assertEqual(parse_review(json.dumps([dict(finding(36), evidence="35: eval(user)")]),
+                                          self.path, chunk), [])
+
+    def test_original_numeric_key_is_preserved(self):
+        chunk = Chunk(35, ["35: value,", "value,"])
+        result = parse_review(json.dumps([dict(finding(35), evidence="35: value,")]), self.path, chunk)
+        self.assertEqual(result[0].line, 35)
 
 
 if __name__ == "__main__":
