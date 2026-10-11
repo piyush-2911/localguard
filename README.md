@@ -101,7 +101,8 @@ scan scan <path> [OPTIONS]
 - `0` — scan completed, no findings at or above `--severity-threshold`
 - `1` — scan completed, one or more findings at or above the threshold
   (useful as a CI gate in a later stage)
-- `2` — scan could not run at all (bad path, no `.py` files, Bandit
+- `2` — LLM-only analysis was incomplete with no findings matching filters,
+  or the scan could not run at all (bad path, no `.py` files, Bandit
   missing, etc.) — no stack trace, just a clear message on stderr
 
 ### LLM-only review
@@ -261,8 +262,33 @@ objects, those complete findings are recovered and a warning notes partial cover
 Warnings never include raw model output or API keys. HTTP, connection and timeout
 errors stop LLM-only scans with a clear message and exit 2; hybrid mode falls back
 to Bandit. Successful processing exits
-1 when reported findings exist, otherwise 0, **even if malformed chunks were
-skipped**; inspect stderr for incomplete coverage before treating a scan as clean.
+1 when reported findings exist. An incomplete LLM-only scan with no findings
+matching the selected filters exits 2; only a completed review with no matching
+findings exits 0. Hybrid mode retains its severity/confidence exit behavior when
+one analyzer provides usable results, including during fallback.
+
+### Incomplete analysis and coverage
+
+All report formats show `complete` or `incomplete` analysis status. Skipped LLM
+chunks, recovered partial JSON, rejected findings, or an unavailable requested
+analyzer mark analysis incomplete. Valid findings from partially processed chunks
+remain in the report. An unavailable analyzer in hybrid mode still uses the
+existing fallback behavior, discarding its partial findings.
+
+JSON includes `analysis_status` and `llm_coverage` (null when LLM processing never
+started). Coverage records `files_total`, `files_completed`, `chunks_attempted`,
+`chunks_completed`, `chunks_skipped`, `findings_rejected`, and `issues`. Each issue
+has a file, absolute line range, and reason; no raw response or API key is recorded.
+Completed files/chunks have no detected processing or validation failures. A chunk
+with rejected findings or recovered JSON is partial, so it counts as attempted
+but neither completed nor skipped. Counts describe processing before report filters
+and deduplication. Text and Markdown show the chunk counts and affected ranges.
+
+For automation that requires both analyzers, check `analysis_status` as well as the
+exit code: hybrid fallback can exit 0 while its report is incomplete. `complete`
+means the requested analysis finished without detected processing failures; it
+does not guarantee every vulnerability was found. Chunk context and configured
+finding limits still apply.
 
 Directory scans skip common environment/build/cache directories and nested
 symlinks. Python encoding declarations are respected. Empty files count as scanned

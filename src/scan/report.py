@@ -22,12 +22,23 @@ def _summary(findings, metadata=None):
             "static": sum(f.source in ("static", "static+llm") for f in findings),
             "llm": sum(f.source in ("llm", "static+llm") for f in findings)}),
         "analyzers": (metadata or {}).get("analyzers", {}),
+        "analysis_status": (metadata or {}).get("analysis_status", "complete"),
+        "llm_coverage": (metadata or {}).get("llm_coverage"),
     }
 
 
 def _summary_lines(findings, metadata):
     summary = _summary(findings, metadata)
-    return ["  ".join(f"{key}: {value}" for key, value in summary["counts_by_confidence"].items()),
+    coverage = summary["llm_coverage"]
+    details = ["Analysis status: " + summary["analysis_status"]]
+    if summary["analysis_status"] == "incomplete":
+        details.append("Analysis incomplete — absence of findings does not indicate a clean scan.")
+    if coverage:
+        details.append(f"LLM chunks: {coverage['chunks_completed']}/{coverage['chunks_attempted']} complete; "
+                       f"skipped: {coverage['chunks_skipped']}; rejected findings: {coverage['findings_rejected']}")
+        details.extend(f"{issue['file']}:{issue['line']}-{issue['end_line']}: {issue['reason']}"
+                       for issue in coverage["issues"])
+    return details + ["  ".join(f"{key}: {value}" for key, value in summary["counts_by_confidence"].items()),
             "Analyzer contributions (before merge/filter): " + ", ".join(
                 f"{key}: {value}" for key, value in summary["analyzer_contributions"].items())] + [
                 value for value in summary["analyzers"].values() if "unavailable" in value]
@@ -68,7 +79,7 @@ def render_text(
         c = counts[sev]
         if c:
             summary_bits.append(f"[{_SEVERITY_STYLE[sev]}]{sev.value.upper()}: {c}[/]")
-    summary_line = "  ".join(summary_bits) if summary_bits else "[bold green]No findings[/]"
+    summary_line = "  ".join(summary_bits) if summary_bits else "No findings match filters"
 
     header = Text.from_markup(
         f"[bold]scan[/] — scanned [bold]{escape(target)}[/] "

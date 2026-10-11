@@ -94,10 +94,11 @@ class ReviewerTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.set_content(content)
                 result = self.invoke("--format", "json")
-                self.assertEqual(result.exit_code, 2 if content == '{"findings": [null]}' else 0, result.output)
+                self.assertEqual(result.exit_code, 2, result.output)
                 self.assertIn("Skipping ", result.stderr)
-                if result.exit_code == 0:
+                if content != '{"findings": [null]}':
                     self.assertEqual(json.loads(result.stdout)["total_findings"], 0)
+                    self.assertEqual(json.loads(result.stdout)["analysis_status"], "incomplete")
 
     def test_http_and_truncation_errors(self):
         for status in (401, 404, 429, 500, 302):
@@ -108,7 +109,64 @@ class ReviewerTests(unittest.TestCase):
             self.assertNotIn("private-value", result.output)
         type(self).status = 200
         self.set_content('[]', finish="length")
-        self.assertEqual(self.invoke().exit_code, 0)
+        self.assertEqual(self.invoke().exit_code, 2)
+
+    def test_partial_findings_coverage_and_filter_exit(self):
+        self.set_content(json.dumps([finding(), dict(finding(), evidence="invented")]))
+        result = self.invoke("--format", "json")
+        self.assertEqual(result.exit_code, 1, result.output)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["analysis_status"], "incomplete")
+        self.assertEqual(report["analyzers"]["llm"], "partial")
+        self.assertEqual(report["llm_coverage"]["findings_rejected"], 1)
+        self.assertEqual(report["llm_coverage"]["files_completed"], 0)
+        self.assertEqual(report["llm_coverage"]["issues"][0]["line"], 1)
+        self.assertEqual(self.invoke("--min-confidence", "likely").exit_code, 2)
+        for output_format in ("text", "markdown"):
+            result = self.invoke("--format", output_format)
+            self.assertIn("Analysis incomplete", result.stdout)
+            self.assertIn("rejected-findings", result.stdout)
+
+    def test_complete_empty_review_coverage(self):
+        self.set_content("[]")
+        result = self.invoke("--format", "json")
+        self.assertEqual(result.exit_code, 0, result.output)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["analysis_status"], "complete")
+        self.assertEqual(report["llm_coverage"]["chunks_completed"], 1)
+        self.assertEqual(report["llm_coverage"]["issues"], [])
+
+    def test_hybrid_failure_reports_incomplete_with_static_fallback(self):
+        type(self).status = 500
+        with patch("scan.cli.scan", return_value=([], 1)):
+            result = CliRunner().invoke(main, ["scan", str(self.path), "--model", "test",
+                                               "--base-url", self.url, "--format", "json"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["analysis_status"], "incomplete")
+        self.assertEqual(report["llm_coverage"]["chunks_skipped"], 1)
+        self.assertEqual(report["analyzers"]["llm"], "LLM analysis unavailable")
+
+    def test_skipped_chunk_does_not_prevent_next_chunk(self):
+        self.path.write_text("x\ny\nz\n")
+        client = Mock()
+        client.review.side_effect = ["not JSON", "[]", "[]"]
+        coverage = {}
+        with self.assertLogs("scan.llm", level="WARNING"):
+            results, files = scan_llm(self.path, client, chunk_lines=1, chunk_overlap=0, coverage=coverage)
+        self.assertEqual((results, files), ([], 1))
+        self.assertEqual(coverage["chunks_attempted"], 3)
+        self.assertEqual(coverage["chunks_completed"], 2)
+        self.assertEqual(coverage["chunks_skipped"], 1)
+        self.assertEqual(coverage["issues"][0]["end_line"], 1)
+
+    def test_recovered_json_marks_partial_coverage(self):
+        self.set_content("[" + json.dumps(finding()) + ', {"line":')
+        result = self.invoke("--format", "json")
+        self.assertEqual(result.exit_code, 1, result.output)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["analysis_status"], "incomplete")
+        self.assertEqual(report["llm_coverage"]["issues"][0]["reason"], "partial-json-recovered")
 
     def test_missing_model_and_invalid_url(self):
         result = CliRunner().invoke(main, ["scan", str(self.path), "--llm-only"], env={"SCAN_MODEL": ""})

@@ -89,6 +89,8 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
     if llm_only and static_only:
         raise click.UsageError("--static-only and --llm-only are mutually exclusive.")
 
+    llm_coverage = {}
+
     def review_llm():
         from .llm import ReviewClient, scan_llm
         if chunk_overlap >= chunk_lines:
@@ -99,6 +101,7 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
             return scan_llm(
                 path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,
                 progress=lambda message: _err_console.print(message, markup=False),
+                coverage=llm_coverage,
             )
         finally:
             client.close()
@@ -122,6 +125,14 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
     except Exception as exc:  # noqa: BLE001 - last-resort guard against stack traces
         _err_console.print(f"[bold red]Unexpected error:[/bold red] {exc}")
         sys.exit(2)
+
+    incomplete = bool(llm_coverage.get("issues")) or any(
+        "unavailable" in status for status in metadata["analyzers"].values())
+    metadata["analysis_status"] = "incomplete" if incomplete else "complete"
+    metadata["llm_coverage"] = llm_coverage or None
+    if llm_coverage.get("issues") and metadata["analyzers"]["llm"] == "available":
+        metadata["analyzers"]["llm"] = "partial"
+        click.echo("Warning: LLM analysis incomplete; see report coverage details.", err=True)
 
     threshold_rank = _SEVERITY_RANK[severity_threshold.lower()]
     confident = [f for f in findings if CONFIDENCE_RANK[f.confidence] >= CONFIDENCE_RANK[min_confidence]]
@@ -149,7 +160,9 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
         # For json/markdown, print plainly.
         click.echo(rendered)
 
-    sys.exit(1 if filtered else 0)
+    # Preserve hybrid fallback exit semantics. An incomplete LLM-only review
+    # with no displayed findings must never signal a successful clean scan.
+    sys.exit(1 if filtered else 2 if llm_only and incomplete else 0)
 
 
 main.add_command(scan_cmd, name="scan")

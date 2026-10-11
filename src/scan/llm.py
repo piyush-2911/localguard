@@ -351,36 +351,68 @@ def parse_review(content: str, path: Path, chunk: Chunk, verbose: bool = False) 
 def scan_llm(target: Path, client: ReviewClient, chunk_chars: int = 12000,
              verbose: bool = False, chunk_lines: int = 250,
              chunk_overlap: int = 20,
-             progress: Callable[[str], None] | None = None) -> tuple[list[Finding], int]:
+             progress: Callable[[str], None] | None = None,
+             coverage: dict | None = None) -> tuple[list[Finding], int]:
     files = python_files(target)
+    coverage = coverage if coverage is not None else {}
+    coverage.update(files_total=len(files), files_completed=0, chunks_attempted=0,
+                    chunks_completed=0, chunks_skipped=0, findings_rejected=0, issues=[])
+
+    def incomplete(path, chunk, reason):
+        coverage["issues"].append({"file": str(path), "line": chunk.start,
+                                   "end_line": chunk.end, "reason": reason})
+
     findings, seen = [], set()
     returned_candidates = False
     for path in files:
+        initial_issues = len(coverage["issues"])
         try:
             with tokenize.open(path) as source:
                 lines = source.read().splitlines()
         except (OSError, UnicodeError, SyntaxError) as exc:
             raise ScanError(f"Unable to read Python source: {path}") from exc
         for chunk in code_chunks(lines, chunk_chars, chunk_lines, chunk_overlap):
+            coverage["chunks_attempted"] += 1
             if progress:
                 progress(f"Reviewing {path} lines {chunk.start}-{chunk.end} with {client.model}...")
             started = time.perf_counter()
             try:
                 content = client.review(chunk)
             except ReviewResponseError as exc:
+                coverage["chunks_skipped"] += 1
+                incomplete(path, chunk, "invalid-or-incomplete-response")
                 logger.warning("Skipping LLM chunk for %s (lines %s-%s): %s", path, chunk.start, chunk.end, exc)
                 continue
+            except ScanError:
+                coverage["chunks_skipped"] += 1
+                incomplete(path, chunk, "llm-request-failed")
+                raise
             finally:
                 if progress:
                     progress(f"Request finished for {path} lines {chunk.start}-{chunk.end} "
                              f"in {time.perf_counter() - started:.1f}s.")
-            candidates, _ = _json_findings(content)
+            candidates, recovered = _json_findings(content)
             returned_candidates = returned_candidates or bool(candidates)
-            for finding in parse_review(content, path, chunk, verbose):
+            parsed = parse_review(content, path, chunk, verbose)
+            if candidates is None:
+                coverage["chunks_skipped"] += 1
+                incomplete(path, chunk, "malformed-json")
+            else:
+                rejected = len(candidates) - len(parsed)
+                coverage["findings_rejected"] += rejected
+                if rejected:
+                    incomplete(path, chunk, "rejected-findings")
+                if recovered:
+                    incomplete(path, chunk, "partial-json-recovered")
+                if not rejected and not recovered:
+                    coverage["chunks_completed"] += 1
+            for finding in parsed:
                 key = (finding.file, finding.line, finding.category.casefold(), finding.description)
                 if key not in seen:
                     seen.add(key)
                     findings.append(finding)
+        if len(coverage["issues"]) == initial_issues:
+            coverage["files_completed"] += 1
     if returned_candidates and not findings:
         raise ScanError("All returned LLM findings failed validation; analysis is incomplete, not clean.")
     return findings, len(files)
