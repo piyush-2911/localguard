@@ -78,18 +78,26 @@ def main() -> None:
               help="Maximum numbered source characters per LLM request.")
 @click.option("--chunk-lines", type=click.IntRange(min=1), default=250, show_default=True,
               help="Maximum lines per LLM chunk.")
+@click.option("--context-chars", envvar="SCAN_CONTEXT_CHARS", type=click.IntRange(min=0),
+              default=12000, show_default=True, help="Additional source context budget in hybrid mode.")
 @click.option("--chunk-overlap", type=click.IntRange(min=0), default=20, show_default=True,
               help="Context lines repeated between chunks; must be smaller than --chunk-lines.")
 def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_file: Path,
              verbose: bool, llm_only: bool, model: str, base_url: str, api_key: str,
              timeout: float, max_tokens: int, max_findings: int, chunk_chars: int,
              chunk_lines: int, chunk_overlap: int, static_only: bool,
-             merge_tolerance: int, min_confidence: str, structured_output: str) -> None:
+             merge_tolerance: int, min_confidence: str, structured_output: str, context_chars: int) -> None:
     """Scan PATH (a file or directory) for security issues."""
     if llm_only and static_only:
         raise click.UsageError("--static-only and --llm-only are mutually exclusive.")
 
     llm_coverage = {}
+    static_findings = []
+
+    def review_static():
+        findings, count = scan(path, verbose=verbose)
+        static_findings.extend(findings)
+        return findings, count
 
     def review_llm():
         from .llm import ReviewClient, scan_llm
@@ -102,6 +110,8 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
                 path, client, chunk_chars, verbose, chunk_lines, chunk_overlap,
                 progress=lambda message: _err_console.print(message, markup=False),
                 coverage=llm_coverage,
+                static_findings=None if llm_only else static_findings,
+                context_chars=context_chars,
             )
         finally:
             client.close()
@@ -117,7 +127,7 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
                         "analyzer_contributions": {"static": len(findings), "llm": 0}}
         else:
             findings, files_scanned, metadata = run_hybrid(
-                lambda: scan(path, verbose=verbose), review_llm, merge_tolerance,
+                review_static, review_llm, merge_tolerance,
                 warning=lambda message: click.echo(f"Warning: {message}", err=True))
     except ScanError as exc:
         _err_console.print(f"[bold red]Error:[/bold red] {exc}")

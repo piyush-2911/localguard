@@ -38,6 +38,13 @@ def _summary_lines(findings, metadata):
                        f"skipped: {coverage['chunks_skipped']}; rejected findings: {coverage['findings_rejected']}")
         details.extend(f"{issue['file']}:{issue['line']}-{issue['end_line']}: {issue['reason']}"
                        for issue in coverage["issues"])
+        if coverage.get("context"):
+            details.append("LLM context: bounded enclosing functions and one-hop local imports; "
+                           "not a complete call graph. Static leads are supplied to the model.")
+            omissions = list(dict.fromkeys(reason for entry in coverage["context"]
+                                          for reason in entry["limitations"]
+                                          if not reason.startswith("Only one-hop")))
+            details.extend("Context limitation: " + reason for reason in omissions)
     return details + ["  ".join(f"{key}: {value}" for key, value in summary["counts_by_confidence"].items()),
             "Analyzer contributions (before merge/filter): " + ", ".join(
                 f"{key}: {value}" for key, value in summary["analyzer_contributions"].items())] + [

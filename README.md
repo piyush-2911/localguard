@@ -17,7 +17,7 @@ scan scan ./myproject --llm-only --model llama3.1
 scan scan ./myproject --merge-tolerance 3 --min-confidence likely --severity-threshold high
 ```
 
-Both analyzers run once. Findings share a fixed category taxonomy. The merger
+Bandit runs first, followed by one LLM review per source chunk. Findings share a fixed category taxonomy. The merger
 pairs same-file, same-category findings whose line ranges overlap or are separated
 by at most `--merge-tolerance` lines (default 3). Nearest pairs match first, one
 static finding to one LLM finding, without chaining nearby issues together.
@@ -47,6 +47,46 @@ including an `LLM analysis unavailable` or `Static analysis unavailable` status 
 every report format. If the LLM fails partway through, its partial findings are
 discarded. If both fail, exit 2. Single-analyzer modes retain their own failure
 behavior. A missing LLM model configuration also permits static fallback.
+
+### Context supplied to hybrid reviews
+
+Hybrid mode supplies Bandit rule/category/location leads alongside numbered source.
+The reviewer still examines every eligible chunk for issues Bandit did not flag.
+If a chunk cuts an enclosing function, the scanner attempts to include the complete
+function, including its guards. It also adds bounded, one-hop local helper modules
+referenced through top-level imports. Nothing in the scanned project is executed.
+The model is instructed to check controls and prerequisites rather than echo leads.
+Bandit findings remain even if the model disagrees or returns no findings.
+
+Every hybrid LLM finding names a file from that request's source manifest. Evidence
+must match code in that file's supplied ranges; an invented path or a helper quote
+attributed to the caller is rejected. An exact, unique quote can correct a wrong
+line number. This validates location, not the truth of a vulnerability claim.
+
+```powershell
+scan scan ./myproject --model llama3.1:latest --context-chars 12000 --format json
+```
+
+`--context-chars` / `SCAN_CONTEXT_CHARS` defaults to 12000 additional serialized
+source characters per request, on top of the primary `--chunk-chars` budget and
+prompt metadata. Set it to 0 to omit additional source. More context can increase
+inference time. `--static-only` and `--llm-only` retain their existing behavior.
+There is no second verification pass.
+
+The context boundary is the target directory, or the parent of a single-file
+target. Context may therefore include sibling helpers for a file scan; findings
+can name those helpers, although `files_scanned` counts primary scan targets only.
+Use a directory target to have Bandit scan those helpers too. External modules,
+symlinked helpers, dynamic imports and recursive import expansion are excluded.
+Oversized helpers are omitted whole, rather than truncating away their controls.
+JSON `llm_coverage.context` records supplied files, lead counts and limitations;
+text and Markdown summarize context limitations too.
+
+This is syntactic context retrieval, not whole-program taint analysis. Rebindings,
+runtime dispatch and package search paths are not resolved. Because the model sees
+Bandit leads, `confirmed` means agreement, **not independent verification**.
+Neither context nor evidence matching guarantees fewer false positives; evaluate
+vulnerable/fixed pairs before claiming accuracy improvements.
 
 ## What it catches
 
@@ -205,6 +245,16 @@ scan scan ./myproject --llm-only --model your-served-model --base-url http://loc
 ```
 
 ### LLM findings and failure behavior
+
+The reviewer prompt asks for the affected input or asset, unsafe operation or
+missing control, and security impact. It checks visible protections before
+reporting an issue, uses specific categories, and requests concrete fixes rather
+than generic advice such as "use safer eval". Descriptions and recommendations
+are each requested under 40 words to leave room for attack conditions and fixes.
+Comments and names are not evidence of vulnerability; unsupported assumptions
+about callers or deployment should be omitted. This remains one review request
+per chunk, with no second verification pass or patch generation. These instructions
+guide the model; schema and source matching cannot enforce semantic accuracy.
 
 By default, the client requests [schema-constrained structured output](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=chat)
 using the standard chat-completions `response_format`. The response is an object

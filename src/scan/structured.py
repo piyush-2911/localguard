@@ -1,5 +1,6 @@
 """Portable strict response schema and local validation for compatible servers."""
 import json
+from copy import deepcopy
 
 from .categories import CATEGORIES
 
@@ -30,7 +31,17 @@ RESPONSE_FORMAT = {
 }
 
 
-def validate_response(content: str, max_findings: int) -> None:
+def response_format(file_ids=None):
+    if file_ids is None:
+        return RESPONSE_FORMAT
+    result = deepcopy(RESPONSE_FORMAT)
+    item = result["json_schema"]["schema"]["properties"]["findings"]["items"]
+    item["required"].append("file")
+    item["properties"]["file"] = {"type": "string", "enum": list(file_ids)}
+    return result
+
+
+def validate_response(content: str, max_findings: int, file_ids=None) -> None:
     """Do not trust servers to enforce response_format; fail closed locally."""
     def unique_keys(pairs):
         obj = {}
@@ -47,8 +58,11 @@ def validate_response(content: str, max_findings: int) -> None:
     if not isinstance(findings, list) or len(findings) > max_findings:
         raise ValueError("Invalid findings array or exceeded finding limit")
     for item in findings:
-        if not isinstance(item, dict) or set(item) != set(FIELDS):
+        expected = set(FIELDS) | ({"file"} if file_ids is not None else set())
+        if not isinstance(item, dict) or set(item) != expected:
             raise ValueError("Missing or unexpected finding fields")
+        if file_ids is not None and item["file"] not in file_ids:
+            raise ValueError("File was not provided for review")
         if type(item["line"]) is not int or item["line"] < 1:
             raise ValueError("Invalid line")
         end = item["end_line"]
