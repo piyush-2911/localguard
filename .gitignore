@@ -25,6 +25,7 @@ dist/
 # Local scan output
 security-report.*
 security-report-*.json
+benchmark-results/
 
 # Environment and editor files
 .env

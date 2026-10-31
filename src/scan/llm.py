@@ -203,6 +203,12 @@ class ReviewClient:
             prompt = prompt.replace("Return [] when there are no findings.", 'Return {"findings": []} when there are no findings.')
             output_instruction = 'Return only {"findings": [...]} matching the supplied schema.'
         if chunk.context is not None:
+            if chunk.context.command_paths is not None:
+                prompt += ('\nThe command_paths field contains bounded static observations, not vulnerability verdicts. '
+                           'Check the cited source and controls. Parameter origins do not establish attacker control. '
+                           'An allowlist may restrict input but its values may still be dangerous. '
+                           'no-shell only describes shell=False; interpreter execution and argument injection remain possible. '
+                           'Unresolved or absent paths are not evidence of safety. Do not invent missing edges.')
             prompt = prompt.replace('{"line": 12,',
                                     '{"file": ' + json.dumps(chunk.context.file_ids[0]) + ', "line": 12,')
             prompt += ('\nEvery finding MUST also include "file", exactly one of the supplied file IDs. '
@@ -426,7 +432,7 @@ def scan_llm(target: Path, client: ReviewClient, chunk_chars: int = 12000,
              chunk_overlap: int = 20,
              progress: Callable[[str], None] | None = None,
              coverage: dict | None = None, static_findings: list[Finding] | None = None,
-             context_chars: int = 12000) -> tuple[list[Finding], int]:
+             context_chars: int = 12000, command_paths: bool = False) -> tuple[list[Finding], int]:
     files = python_files(target)
     coverage = coverage if coverage is not None else {}
     coverage.update(files_total=len(files), files_completed=0, chunks_attempted=0,
@@ -449,10 +455,19 @@ def scan_llm(target: Path, client: ReviewClient, chunk_chars: int = 12000,
             if static_findings is not None:
                 context = build_context(target, path, lines, chunk.start, chunk.lines,
                                         static_findings, context_chars)
+                if command_paths:
+                    from .command_paths import trace_commands
+                    try:
+                        context.command_paths = trace_commands(context.blocks)
+                    except (RecursionError, ValueError, TypeError):
+                        context.command_paths = {'paths': [], 'restrictions': [],
+                                                 'limitations': ['Path analysis could not resolve this source.']}
                 chunk = replace(chunk, context=context)
                 coverage.setdefault("context", []).append({
                     "file": str(path), "line": chunk.start, "files": context.file_ids,
                     "static_leads": len(context.leads), "limitations": context.limitations})
+                if command_paths:
+                    coverage['context'][-1]['command_paths'] = context.command_paths
             coverage["chunks_attempted"] += 1
             if progress:
                 progress(f"Reviewing {path} lines {chunk.start}-{chunk.end} with {client.model}...")

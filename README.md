@@ -88,6 +88,43 @@ Bandit leads, `confirmed` means agreement, **not independent verification**.
 Neither context nor evidence matching guarantees fewer false positives; evaluate
 vulnerable/fixed pairs before claiming accuracy improvements.
 
+### Experimental command paths
+
+`--command-paths` adds bounded argument-flow observations to hybrid review. It is
+off by default so comparisons can use the unchanged pipeline. It does not add
+findings, suppress Bandit results, change confidence levels, or make another LLM
+request. Use a directory target to supply caller and helper modules:
+
+```powershell
+scan scan ./myproject --model llama3.1:latest --command-paths --format json
+```
+
+The prototype tracks parameters through simple assignments, reassignment,
+string concatenation, directly named local function arguments/returns and
+explicit imports into supplied local modules. It recognizes `os.system` and
+common `subprocess` calls, records the `shell` argument, literal rejecting
+membership checks, and visible literal mapping selections. Parameters have
+unknown trust; an observed input path does not establish attacker control.
+
+Trace statuses are observations: `parameter-to-shell`, `constant-shell-command`,
+`no-shell`, or `unresolved`. Even `no-shell` is not a general safety verdict:
+explicit interpreter invocation and argument injection still require review.
+An allowlist's values may themselves be dangerous. Guards are attached to the
+value they constrain and are discarded when that value is overwritten.
+
+This is **not whole-program taint analysis**. Loops, complex branching, decorators,
+dynamic dispatch, mutation, external callers and runtime module binding are not
+proven. Unsupported paths remain unresolved or omitted with limitations. Only
+contiguous supplied source starting at line 1 is traced; no missing code is filled
+in or fetched. Limits are 3 helper-call levels, 40 path records, 40 restriction
+records, and 5000 expression visits per request. The extra evidence may increase
+inference time. JSON records it under `llm_coverage.context[].command_paths`.
+
+The [command experiment](benchmarks/README.md#command-path-experiment) contains
+eight vulnerable/fixed pairs and commands for comparing both modes. Better
+detection or fewer false positives must be measured; the trace feature itself
+does not establish either improvement.
+
 ## What it catches
 
 Whatever Bandit's ruleset covers: hardcoded passwords/secrets, `eval()` and
@@ -449,6 +486,16 @@ python -m unittest discover -s tests -v
 ```
 
 Tests use a local HTTP fixture; no model or remote service is needed.
+
+### Paired model benchmark
+
+The [benchmark guide](benchmarks/README.md) describes 12 vulnerable/fixed pairs,
+an opt-in model comparison runner, independent LLM scoring, and manual checks for
+diagnosis and recommendation quality. Run the fast Bandit baseline first:
+
+```powershell
+python -m benchmarks.run --static-only --output benchmark-results/bandit
+```
 
 ## What's next (later stages, not in this release)
 

@@ -80,16 +80,20 @@ def main() -> None:
               help="Maximum lines per LLM chunk.")
 @click.option("--context-chars", envvar="SCAN_CONTEXT_CHARS", type=click.IntRange(min=0),
               default=12000, show_default=True, help="Additional source context budget in hybrid mode.")
+@click.option("--command-paths", is_flag=True, help="Experimental bounded command argument tracing in hybrid mode.")
 @click.option("--chunk-overlap", type=click.IntRange(min=0), default=20, show_default=True,
               help="Context lines repeated between chunks; must be smaller than --chunk-lines.")
 def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_file: Path,
              verbose: bool, llm_only: bool, model: str, base_url: str, api_key: str,
              timeout: float, max_tokens: int, max_findings: int, chunk_chars: int,
              chunk_lines: int, chunk_overlap: int, static_only: bool,
-             merge_tolerance: int, min_confidence: str, structured_output: str, context_chars: int) -> None:
+             merge_tolerance: int, min_confidence: str, structured_output: str, context_chars: int,
+             command_paths: bool) -> None:
     """Scan PATH (a file or directory) for security issues."""
     if llm_only and static_only:
         raise click.UsageError("--static-only and --llm-only are mutually exclusive.")
+    if command_paths and (llm_only or static_only):
+        raise click.UsageError("--command-paths requires hybrid mode.")
 
     llm_coverage = {}
     static_findings = []
@@ -112,6 +116,7 @@ def scan_cmd(path: Path, severity_threshold: str, output_format: str, output_fil
                 coverage=llm_coverage,
                 static_findings=None if llm_only else static_findings,
                 context_chars=context_chars,
+                command_paths=command_paths,
             )
         finally:
             client.close()

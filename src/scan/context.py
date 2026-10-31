@@ -25,16 +25,19 @@ class ReviewContext:
     blocks: list[SourceBlock]
     leads: list[dict] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
+    command_paths: dict | None = None
 
     @property
     def file_ids(self):
         return list(dict.fromkeys(block.file_id for block in self.blocks))
 
     def render(self):
-        return json.dumps({"primary_file": self.blocks[0].file_id,
+        data = {"primary_file": self.blocks[0].file_id,
                            "sources": [b.payload() for b in self.blocks],
-                           "static_leads": self.leads, "context_limits": self.limitations},
-                          ensure_ascii=True)
+                           "static_leads": self.leads, "context_limits": self.limitations}
+        if self.command_paths is not None:
+            data['command_paths'] = self.command_paths
+        return json.dumps(data, ensure_ascii=True)
 
 
 def build_context(target: Path, path: Path, lines: list[str], start: int,
