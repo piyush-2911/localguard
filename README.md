@@ -1,4 +1,4 @@
-# scan
+# LocalGuard
 
 A security scanner CLI for Python code.
 
